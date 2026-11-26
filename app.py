@@ -60,8 +60,8 @@ def get_exchange():
 def get_all_active_binance_coins(min_volume_usd, limit_n):
     """Fetches ALL Binance USDT coins in 1 fast call & filters high-volume active movers."""
     urls = [
-        "https://data-api.binance.vision/api/v3/ticker/24hr",
-        "https://api.binance.us/api/v3/ticker/24hr"
+        "https://fapi.binance.com/fapi/v1/ticker/24hr",
+        "https://fapi.binance.com/fapi/v1/ticker/24hr"
     ]
     exclude_bases = ("USDC", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "BUSD", "AEUR", "USTC")
     for u in urls:
