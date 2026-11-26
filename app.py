@@ -36,19 +36,25 @@ def get_exchange():
     if not api_key or not api_secret:
         return None
     is_testnet = "Testnet" in exec_mode
-    config = {
+    exchange = ccxt.binance({
         "apiKey": api_key.strip(),
         "secret": api_secret.strip(),
         "enableRateLimit": True,
         "options": {
             "defaultType": "future" if market_type == "futures" else "spot",
             "adjustForTimeDifference": True,
-            "fetchCurrencies": False
+            "fetchCurrencies": False,
         }
-    }
-    exchange = ccxt.binance(config)
+    })
     if is_testnet:
         exchange.set_sandbox_mode(True)
+        # Override blocked spot testnet URL with Futures Testnet / Demo endpoints
+        if market_type == "futures":
+            exchange.urls["api"]["fapiPublic"] = "https://testnet.binancefuture.com/fapi/v1"
+            exchange.urls["api"]["fapiPrivate"] = "https://testnet.binancefuture.com/fapi/v1"
+            exchange.urls["api"]["fapiPrivateV2"] = "https://testnet.binancefuture.com/fapi/v2"
+            exchange.urls["api"]["public"] = "https://testnet.binancefuture.com/fapi/v1"
+            exchange.urls["api"]["private"] = "https://testnet.binancefuture.com/fapi/v1"
     return exchange
 
 def fetch_candles_safe(clean_sym, tf):
@@ -116,41 +122,91 @@ def analyze_pair(symbol, tf):
 
 def execute_auto_trade(exchange, row):
     symbol = row["Pair"]
-    side = "buy" if row["Signal"] == "LONG" else "sell"
-    close_side = "sell" if side == "buy" else "buy"
+    clean_sym = symbol.replace("/", "")
+    side = "BUY" if row["Signal"] == "LONG" else "SELL"
+    close_side = "SELL" if side == "BUY" else "BUY"
     price = row["Price"]
 
-    # Load markets first so precision & symbol info work
-    markets = exchange.load_markets()
-    market_sym = symbol if symbol in markets else f"{symbol}:USDT"
-
     if market_type == "futures":
+        # Direct Futures API call (bypasses blocked spot exchangeInfo endpoint)
         try:
-            exchange.set_margin_mode("isolated", market_sym)
+            exchange.fapiPrivatePostMarginType({"symbol": clean_sym, "marginType": "ISOLATED"})
         except Exception:
             pass
         try:
-            exchange.set_leverage(leverage, market_sym)
+            exchange.fapiPrivatePostLeverage({"symbol": clean_sym, "leverage": leverage})
         except Exception:
             pass
-        amount = (trade_usdt * leverage) / price
-    else:
-        amount = trade_usdt / price
 
-    amount = float(exchange.amount_to_precision(market_sym, amount))
-    sl_price = float(exchange.price_to_precision(market_sym, row["Stop-Loss"]))
-    tp_price = float(exchange.price_to_precision(market_sym, row["Take-Profit"]))
+        raw_qty = (trade_usdt * leverage) / price
+        qty = round(raw_qty, 3) if price < 10 else (round(raw_qty, 2) if price < 500 else round(raw_qty, 3))
+        if qty <= 0:
+            qty = 1
 
-    order = exchange.create_market_order(market_sym, side, amount)
-    if market_type == "futures":
+        order = exchange.fapiPrivatePostOrder({
+            "symbol": clean_sym,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty
+        })
+        sl_price = round(row["Stop-Loss"], 4 if price < 10 else 2)
+        tp_price = round(row["Take-Profit"], 4 if price < 10 else 2)
         try:
-            exchange.create_order(market_sym, "STOP_MARKET", close_side, amount, params={"stopPrice": sl_price, "reduceOnly": True})
-            exchange.create_order(market_sym, "TAKE_PROFIT_MARKET", close_side, amount, params={"stopPrice": tp_price, "reduceOnly": True})
+            exchange.fapiPrivatePostOrder({
+                "symbol": clean_sym, "side": close_side, "type": "STOP_MARKET",
+                "stopPrice": sl_price, "closePosition": "true"
+            })
+            exchange.fapiPrivatePostOrder({
+                "symbol": clean_sym, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": tp_price, "closePosition": "true"
+            })
         except Exception as e:
-            st.warning(f"Main order placed, SL/TP note: {e}")
-    return order["id"]
+            st.warning(f"Trade opened, SL/TP note: {e}")
+        return order.get("orderId", "OK")
+    else:
+        markets = exchange.load_markets()
+        amount = float(exchange.amount_to_precision(symbol, trade_usdt / price))
+        order = exchange.create_market_order(symbol, side.lower(), amount)
+        return order["id"]
 
-# --- MAIN EXECUTION ---
+# --- 1. LIVE ACCOUNT & PROFIT/LOSS DASHBOARD ---
+ex = get_exchange()
+if ex and market_type == "futures":
+    st.subheader("💰 Live Wallet, Open Positions & Profit / Loss (PnL)")
+    try:
+        acc = ex.fapiPrivateV2GetAccount()
+        total_bal = float(acc.get("totalWalletBalance", 0))
+        unrealized_pnl = float(acc.get("totalUnrealizedProfit", 0))
+        avail_bal = float(acc.get("availableBalance", 0))
+
+        positions = [p for p in acc.get("positions", []) if float(p.get("positionAmt", 0)) != 0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Wallet Balance", f"${total_bal:,.2f} USDT")
+        c2.metric("Live Profit / Loss (PnL)", f"${unrealized_pnl:+,.2f} USDT", delta=f"{unrealized_pnl:+.2f}$")
+        c3.metric("Available Margin", f"${avail_bal:,.2f} USDT")
+        c4.metric("Active Open Trades", f"{len(positions)} / {max_open_trades}")
+
+        if positions:
+            pos_list = []
+            for p in positions:
+                amt = float(p.get("positionAmt", 0))
+                pos_list.append({
+                    "Coin": p.get("symbol"),
+                    "Side": "🟢 LONG" if amt > 0 else "🔴 SHORT",
+                    "Size": abs(amt),
+                    "Entry Price": round(float(p.get("entryPrice", 0)), 5),
+                    "Live PnL ($)": round(float(p.get("unrealizedProfit", 0)), 3),
+                    "Leverage": f"{p.get('leverage')}x"
+                })
+            st.dataframe(pd.DataFrame(pos_list), use_container_width=True, hide_index=True)
+        else:
+            st.info("Abhi koi active trade open nahi hai.")
+    except Exception as e:
+        st.error(f"Account Balance Fetch Error: {e}")
+    st.divider()
+
+# --- 2. MARKET SCANNER & AUTO-EXECUTION ---
 rows = [analyze_pair(sym, timeframe) for sym in WATCHLIST]
 rows = [r for r in rows if r is not None]
 
@@ -163,7 +219,6 @@ else:
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     if "Scan & Signals Only" not in exec_mode:
-        ex = get_exchange()
         if not ex:
             st.warning("⚠️ Left sidebar mein Binance API Key aur Secret daalein.")
         elif not opportunities.empty:
