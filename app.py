@@ -18,7 +18,7 @@ market_type = st.sidebar.radio("Market Type", ["futures", "spot"], index=0)
 timeframe = st.sidebar.selectbox("Candle Timeframe", ["1m", "5m", "15m", "1h", "4h"], index=1)
 
 st.sidebar.header("2️⃣ Risk & Auto-Trade Rules")
-trade_usdt = st.sidebar.number_input("Margin Per Trade ($ USDT)", min_value=10, max_value=5000, value=25, step=5)
+trade_usdt = st.sidebar.number_input("Margin Per Trade ($ USDT)", min_value=10, max_value=5000, value=15, step=5)
 leverage = st.sidebar.slider("Futures Leverage (Isolated)", min_value=1, max_value=5, value=3)
 max_open_trades = st.sidebar.slider("Max Open Trades at Once", min_value=1, max_value=5, value=2)
 auto_run = st.sidebar.checkbox("🔄 Auto-Scan & Execute Every 30 Seconds", value=False)
@@ -35,18 +35,23 @@ WATCHLIST = [
 def get_exchange():
     if not api_key or not api_secret:
         return None
-    exchange = ccxt.binance({
-        "apiKey": api_key,
-        "secret": api_secret,
+    is_testnet = "Testnet" in exec_mode
+    config = {
+        "apiKey": api_key.strip(),
+        "secret": api_secret.strip(),
         "enableRateLimit": True,
-        "options": {"defaultType": "future" if market_type == "futures" else "spot"}
-    })
-    if "Testnet" in exec_mode:
+        "options": {
+            "defaultType": "future" if market_type == "futures" else "spot",
+            "adjustForTimeDifference": True,
+            "fetchCurrencies": False
+        }
+    }
+    exchange = ccxt.binance(config)
+    if is_testnet:
         exchange.set_sandbox_mode(True)
     return exchange
 
 def fetch_candles_safe(clean_sym, tf):
-    # Global non-blocked endpoints (Binance Vision -> Bybit fallback)
     urls = [
         f"https://data-api.binance.vision/api/v3/klines?symbol={clean_sym}&interval={tf}&limit=80",
         f"https://api.binance.us/api/v3/klines?symbol={clean_sym}&interval={tf}&limit=80"
@@ -115,24 +120,34 @@ def execute_auto_trade(exchange, row):
     close_side = "sell" if side == "buy" else "buy"
     price = row["Price"]
 
+    # Load markets first so precision & symbol info work
+    markets = exchange.load_markets()
+    market_sym = symbol if symbol in markets else f"{symbol}:USDT"
+
     if market_type == "futures":
         try:
-            exchange.set_margin_mode("isolated", symbol)
+            exchange.set_margin_mode("isolated", market_sym)
         except Exception:
             pass
-        exchange.set_leverage(leverage, symbol)
+        try:
+            exchange.set_leverage(leverage, market_sym)
+        except Exception:
+            pass
         amount = (trade_usdt * leverage) / price
     else:
         amount = trade_usdt / price
 
-    amount = float(exchange.amount_to_precision(symbol, amount))
-    sl_price = float(exchange.price_to_precision(symbol, row["Stop-Loss"]))
-    tp_price = float(exchange.price_to_precision(symbol, row["Take-Profit"]))
+    amount = float(exchange.amount_to_precision(market_sym, amount))
+    sl_price = float(exchange.price_to_precision(market_sym, row["Stop-Loss"]))
+    tp_price = float(exchange.price_to_precision(market_sym, row["Take-Profit"]))
 
-    order = exchange.create_market_order(symbol, side, amount)
+    order = exchange.create_market_order(market_sym, side, amount)
     if market_type == "futures":
-        exchange.create_order(symbol, "STOP_MARKET", close_side, amount, params={"stopPrice": sl_price, "reduceOnly": True})
-        exchange.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, amount, params={"stopPrice": tp_price, "reduceOnly": True})
+        try:
+            exchange.create_order(market_sym, "STOP_MARKET", close_side, amount, params={"stopPrice": sl_price, "reduceOnly": True})
+            exchange.create_order(market_sym, "TAKE_PROFIT_MARKET", close_side, amount, params={"stopPrice": tp_price, "reduceOnly": True})
+        except Exception as e:
+            st.warning(f"Main order placed, SL/TP note: {e}")
     return order["id"]
 
 # --- MAIN EXECUTION ---
@@ -140,7 +155,7 @@ rows = [analyze_pair(sym, timeframe) for sym in WATCHLIST]
 rows = [r for r in rows if r is not None]
 
 if not rows:
-    st.warning("⏳ Market data load ho raha hai ya server busy hai. Thori der baad page refresh karein.")
+    st.warning("⏳ Market data load ho raha hai. Thori der baad page refresh karein.")
 else:
     df = pd.DataFrame(rows)
     opportunities = df[df["Signal"] != "WAIT"]
