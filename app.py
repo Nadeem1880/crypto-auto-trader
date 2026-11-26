@@ -26,7 +26,6 @@ auto_run = st.sidebar.checkbox("🔄 Auto-Scan & Execute Every 30 Seconds", valu
 api_key = st.sidebar.text_input("Binance API Key", type="password")
 api_secret = st.sidebar.text_input("Binance API Secret", type="password")
 
-# Major Coins + High-Volume Meme Coins
 WATCHLIST = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT",
     "DOGE/USDT", "PEPE/USDT", "WIF/USDT", "BONK/USDT", "SHIB/USDT",
@@ -46,12 +45,26 @@ def get_exchange():
         exchange.set_sandbox_mode(True)
     return exchange
 
+def fetch_candles_safe(clean_sym, tf):
+    # Global non-blocked endpoints (Binance Vision -> Bybit fallback)
+    urls = [
+        f"https://data-api.binance.vision/api/v3/klines?symbol={clean_sym}&interval={tf}&limit=80",
+        f"https://api.binance.us/api/v3/klines?symbol={clean_sym}&interval={tf}&limit=80"
+    ]
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=6).json()
+            if isinstance(r, list) and len(r) >= 30:
+                return r
+        except Exception:
+            continue
+    return None
+
 def analyze_pair(symbol, tf):
     try:
         clean_sym = symbol.replace("/", "")
-        base_url = "https://fapi.binance.com/fapi/v1/klines" if market_type == "futures" else "https://api.binance.com/api/v3/klines"
-        data = requests.get(f"{base_url}?symbol={clean_sym}&interval={tf}&limit=80", timeout=8).json()
-        if not isinstance(data, list) or len(data) < 30:
+        data = fetch_candles_safe(clean_sym, tf)
+        if not data:
             return None
 
         closes = pd.Series([float(x[4]) for x in data])
@@ -68,18 +81,17 @@ def analyze_pair(symbol, tf):
         loss = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
         rsi = 100 - (100 / (1 + (gain / loss if loss != 0 else 0)))
 
-        vol_spike = vols.iloc[-1] > (vols.rolling(20).mean().iloc[-1] * 1.3)
+        vol_spike = vols.iloc[-1] > (vols.rolling(20).mean().iloc[-1] * 1.2)
         atr = (highs - lows).rolling(14).mean().iloc[-1]
 
         signal = "WAIT"
         sl, tp = 0.0, 0.0
 
-        # Momentum Breakout + Volume Spike OR Oversold Bounce
-        if (price > ema9 > ema21 and 52 <= rsi <= 68 and vol_spike) or (rsi < 30 and price > closes.iloc[-2]):
+        if (price > ema9 > ema21 and 50 <= rsi <= 68 and vol_spike) or (rsi < 32 and price > closes.iloc[-2]):
             signal = "LONG"
             sl = price - (1.8 * atr)
             tp = price + (3.2 * atr)
-        elif market_type == "futures" and ((price < ema9 < ema21 and 32 <= rsi <= 48 and vol_spike) or (rsi > 74 and price < closes.iloc[-2])):
+        elif market_type == "futures" and ((price < ema9 < ema21 and 32 <= rsi <= 50 and vol_spike) or (rsi > 72 and price < closes.iloc[-2])):
             signal = "SHORT"
             sl = price + (1.8 * atr)
             tp = price - (3.2 * atr)
@@ -117,9 +129,7 @@ def execute_auto_trade(exchange, row):
     sl_price = float(exchange.price_to_precision(symbol, row["Stop-Loss"]))
     tp_price = float(exchange.price_to_precision(symbol, row["Take-Profit"]))
 
-    # 1. Main Entry Order
     order = exchange.create_market_order(symbol, side, amount)
-    # 2. Server-Side Stop-Loss & Take-Profit
     if market_type == "futures":
         exchange.create_order(symbol, "STOP_MARKET", close_side, amount, params={"stopPrice": sl_price, "reduceOnly": True})
         exchange.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, amount, params={"stopPrice": tp_price, "reduceOnly": True})
@@ -128,24 +138,27 @@ def execute_auto_trade(exchange, row):
 # --- MAIN EXECUTION ---
 rows = [analyze_pair(sym, timeframe) for sym in WATCHLIST]
 rows = [r for r in rows if r is not None]
-df = pd.DataFrame(rows)
 
-opportunities = df[df["Signal"] != "WAIT"]
-st.subheader(f"🎯 Live Opportunities Found: {len(opportunities)} (Timeframe: {timeframe} | {market_type.upper()})")
-st.dataframe(df, use_container_width=True, hide_index=True)
+if not rows:
+    st.warning("⏳ Market data load ho raha hai ya server busy hai. Thori der baad page refresh karein.")
+else:
+    df = pd.DataFrame(rows)
+    opportunities = df[df["Signal"] != "WAIT"]
+    st.subheader(f"🎯 Live Opportunities Found: {len(opportunities)} (Timeframe: {timeframe} | {market_type.upper()})")
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-if "Scan & Signals Only" not in exec_mode:
-    ex = get_exchange()
-    if not ex:
-        st.warning("⚠️ Left sidebar mein Binance API Key aur Secret daalein.")
-    elif not opportunities.empty:
-        for _, opp in opportunities.head(max_open_trades).iterrows():
-            if st.button(f"⚡ Execute {opp['Signal']} on {opp['Pair']}") or auto_run:
-                try:
-                    oid = execute_auto_trade(ex, opp)
-                    st.success(f"✅ Order Placed: {opp['Signal']} {opp['Pair']} | Entry: {opp['Entry']} | SL: {opp['Stop-Loss']} | TP: {opp['Take-Profit']} (ID: {oid})")
-                except Exception as e:
-                    st.error(f"❌ {opp['Pair']} Error: {e}")
+    if "Scan & Signals Only" not in exec_mode:
+        ex = get_exchange()
+        if not ex:
+            st.warning("⚠️ Left sidebar mein Binance API Key aur Secret daalein.")
+        elif not opportunities.empty:
+            for _, opp in opportunities.head(max_open_trades).iterrows():
+                if st.button(f"⚡ Execute {opp['Signal']} on {opp['Pair']}") or auto_run:
+                    try:
+                        oid = execute_auto_trade(ex, opp)
+                        st.success(f"✅ Order Placed: {opp['Signal']} {opp['Pair']} | Entry: {opp['Entry']} | SL: {opp['Stop-Loss']} | TP: {opp['Take-Profit']} (ID: {oid})")
+                    except Exception as e:
+                        st.error(f"❌ {opp['Pair']} Error: {e}")
 
 if auto_run:
     time.sleep(30)
